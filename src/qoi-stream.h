@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include <string.h>
+#include <stdbool.h>
 
+// Enable this to always check if the provided buffers are big enough for the output
 // #define SAFE_BUFFER
 
 #ifndef QOIS_STREAM_H
@@ -11,13 +13,28 @@ extern "C"
 {
 #endif
 
-#ifndef SAFE_BUFFER
+// Util functions for asserting buffer size
+#ifdef SAFE_BUFFER
 #define PROGRESS_OUTPUT(value) \
-  output += value;
+  output += (value);           \
+  output_size -= (size_t)(value);
+#define ASSERT_OUTPUT_AVAILABLE(value) \
+  if (output_size < (value))           \
+    return -1;
 #else
 #define PROGRESS_OUTPUT(value) \
-  output += value;             \
-  output_size -= (size_t)value;
+  output += (value);
+#define ASSERT_OUTPUT_AVAILABLE(value) \
+  (void)output_size;
+#endif
+
+// Util functions for converting endianness
+#if defined(__BIG_ENDIAN) || defined(__BIG_ENDIAN__) || defined(_BIG_ENDIAN)
+#define MAKE_BIG_ENDIAN_32(value) (value)
+#define MAKE_LITTLE_ENDIAN_32(value) __builtin_bswap32(value)
+#else
+#define MAKE_BIG_ENDIAN_32(value) __builtin_bswap32(value)
+#define MAKE_LITTLE_ENDIAN_32(value) (value)
 #endif
 
   // Constants
@@ -27,11 +44,11 @@ extern "C"
 
   // Types
 
-  typedef struct _qois_header
+  typedef struct __attribute__((packed)) _qois_header
   {
     uint8_t magic[4];
-    uint8_t width[4];  // Big endian
-    uint8_t height[4]; // Big endian
+    uint32_t width;  // Big endian
+    uint32_t height; // Big endian
     uint8_t channels;
     uint8_t colorspace;
   } qois_header;
@@ -104,9 +121,10 @@ extern "C"
 
   // Util functions
 
-  static inline uint8_t _qois_pixel_cmp(qois_pixel *a, qois_pixel *b)
+  // Returns true if pixel is the same
+  static inline bool _qois_pixel_cmp(qois_pixel *a, qois_pixel *b)
   {
-    return a->r == b->r && a->g == b->g && a->b == b->b && a->a == b->a;
+    return memcmp(a, b, sizeof(qois_pixel)) == 0;
   }
 
   static inline uint8_t _qois_pixel_hash(qois_pixel *pixel)
@@ -136,7 +154,6 @@ extern "C"
                            uint32_t width, uint32_t height, uint8_t channels, uint8_t colorspace)
 
   {
-    _qois_desc_init(&state->desc);
     state->desc.width = width;
     state->desc.height = height;
     state->desc.channels = channels;
@@ -155,46 +172,54 @@ extern "C"
 
   void qois_dec_state_init(qois_dec_state *state)
   {
+    _qois_desc_init(&state->desc);
+
     state->state = QOIS_STATE_HEADER;
     state->op_data = 0;
     state->op_position = 0;
     state->pixels_out = 0;
     state->pixels_count = 0;
 
-    memset(state->cache, 0, sizeof(state->cache));
     _qois_pixel_init(&state->current_pixel);
     _qois_pixel_init(&state->last_pixel);
-    _qois_desc_init(&state->desc);
+    memset(state->cache, 0, sizeof(state->cache));
   }
 
   // Encode functions
 
   static inline int _qois_encode_header(qois_enc_state *state, uint8_t *output, size_t output_size)
   {
-#ifdef SAFE_BUFFER
-    if (output_size < sizeof(qois_header))
-      return -1;
-#endif
-    (void)output_size;
+    ASSERT_OUTPUT_AVAILABLE(sizeof(qois_header));
 
-    output[0] = qois_magic[0];
-    output[1] = qois_magic[1];
-    output[2] = qois_magic[2];
-    output[3] = qois_magic[3];
+    qois_header *header = (void *)output;
 
-    output[4] = (uint8_t)(state->desc.width >> 24) & 0xff;
-    output[5] = (uint8_t)(state->desc.width >> 16) & 0xff;
-    output[6] = (uint8_t)(state->desc.width >> 8) & 0xff;
-    output[7] = (uint8_t)(state->desc.width >> 0) & 0xff;
+    memcpy(header->magic, qois_magic, sizeof(qois_magic));
 
-    output[8] = (uint8_t)(state->desc.height >> 24) & 0xff;
-    output[9] = (uint8_t)(state->desc.height >> 16) & 0xff;
-    output[10] = (uint8_t)(state->desc.height >> 8) & 0xff;
-    output[11] = (uint8_t)(state->desc.height >> 0) & 0xff;
+    header->width = MAKE_BIG_ENDIAN_32(state->desc.width);
+    header->height = MAKE_BIG_ENDIAN_32(state->desc.height);
+    header->channels = state->desc.channels;
+    header->colorspace = state->desc.colorspace;
 
-    output[12] = state->desc.channels;
-    output[13] = state->desc.colorspace;
     return sizeof(qois_header);
+  }
+
+  static inline int _qois_encode_pixel_runlength(qois_enc_state *state, uint8_t *output, size_t output_size)
+  {
+    ASSERT_OUTPUT_AVAILABLE(1);
+
+    if (state->run_length == 1)
+    {
+      uint8_t hash = _qois_pixel_hash(&state->last_pixel);
+      output[0] = 0x00 | hash;
+    }
+    else
+    {
+      output[0] = 0xc0 | (state->run_length - 1);
+    }
+
+    state->run_length = 0;
+
+    return 1;
   }
 
   static inline int _qois_encode_pixel_byte(qois_enc_state *state, uint8_t byte, uint8_t *output, size_t output_size)
@@ -212,39 +237,28 @@ extern "C"
 
     // RUN LENGTH
 
-    uint8_t finish_run_length_immediately = 0;
     if (_qois_pixel_cmp(&state->current_pixel, &state->last_pixel))
     {
       state->run_length++;
       if (state->run_length < 62 && state->pixels_in < state->pixels_count)
         return 0;
-      finish_run_length_immediately = 1;
+
+      // If we are here we need to finish the run length
+      int result = _qois_encode_pixel_runlength(state, output, output_size);
+      if (result < 0)
+        return result;
+      outputted += result;
+      goto finish_pixel;
     }
 
     if (state->run_length > 0)
     {
-#ifdef SAFE_BUFFER
-      if (output_size < 1)
-        return -1;
-#endif
+      int result = _qois_encode_pixel_runlength(state, output, output_size);
+      if (result < 0)
+        return result;
 
-      if (state->run_length == 1)
-      {
-        uint8_t hash = _qois_pixel_hash(&state->last_pixel);
-        output[0] = 0b00000000 | hash;
-      }
-      else
-      {
-        output[0] = 0b11000000 | (state->run_length - 1);
-      }
-
-      state->run_length = 0;
-      outputted += 1;
-      PROGRESS_OUTPUT(1);
-
-      // Can only come here if this pixel is also a run length pixel
-      if (finish_run_length_immediately)
-        goto finish_pixel;
+      PROGRESS_OUTPUT(result);
+      outputted += result;
     }
 
     // INDEX
@@ -253,12 +267,9 @@ extern "C"
       uint8_t hash = _qois_pixel_hash(&state->current_pixel);
       if (_qois_pixel_cmp(&state->current_pixel, &state->cache[hash]))
       {
-#ifdef SAFE_BUFFER
-        if (output_size < 1)
-          return -1;
-#endif
+        ASSERT_OUTPUT_AVAILABLE(1);
 
-        output[0] = 0b00000000 | hash;
+        output[0] = 0x00 | hash;
         outputted += 1;
         goto finish_pixel;
       }
@@ -268,12 +279,9 @@ extern "C"
 
     if (state->desc.channels > 3 && state->current_pixel.a != state->last_pixel.a)
     {
-#ifdef SAFE_BUFFER
-      if (output_size < 5)
-        return -1;
-#endif
+      ASSERT_OUTPUT_AVAILABLE(2);
 
-      output[0] = 0b11111111;
+      output[0] = 0xff;
       output[1] = state->current_pixel.r;
       output[2] = state->current_pixel.g;
       output[3] = state->current_pixel.b;
@@ -295,12 +303,9 @@ extern "C"
           green_diff <= 1 && green_diff >= -2 &&
           blue_diff <= 1 && blue_diff >= -2)
       {
-#ifdef SAFE_BUFFER
-        if (output_size < 1)
-          return -1;
-#endif
+        ASSERT_OUTPUT_AVAILABLE(1);
 
-        output[0] = (uint8_t)0b01000000 |
+        output[0] = (uint8_t)0x40 |
                     (uint8_t)((red_diff + 2) << 4) |
                     (uint8_t)((green_diff + 2) << 2) |
                     (uint8_t)((blue_diff + 2) << 0);
@@ -319,12 +324,9 @@ extern "C"
           green_diff >= -32 && green_diff <= 31 &&
           db_dg >= -8 && db_dg <= 7)
       {
-#ifdef SAFE_BUFFER
-        if (output_size < 2)
-          return -1;
-#endif
+        ASSERT_OUTPUT_AVAILABLE(2);
 
-        output[0] = 0b10000000 | (uint8_t)(green_diff + 32);
+        output[0] = 0x80 | (uint8_t)(green_diff + 32);
         output[1] = ((uint8_t)(dr_dg + 8) << 4) | ((uint8_t)(db_dg + 8) << 0);
 
         outputted += 2;
@@ -335,12 +337,9 @@ extern "C"
     // RGB
 
     {
-#ifdef SAFE_BUFFER
-      if (output_size < 4)
-        return -1;
-#endif
+      ASSERT_OUTPUT_AVAILABLE(4);
 
-      output[0] = 0b11111110;
+      output[0] = 0xfe;
       output[1] = state->current_pixel.r;
       output[2] = state->current_pixel.g;
       output[3] = state->current_pixel.b;
@@ -350,7 +349,7 @@ extern "C"
     }
 
     {
-    finish_pixel:
+    finish_pixel:;
 
       uint8_t hash = _qois_pixel_hash(&state->current_pixel);
       state->cache[hash] = state->current_pixel;
@@ -391,15 +390,12 @@ extern "C"
 
     if (state->state == QOIS_STATE_FOOTER)
     {
-#ifdef SAFE_BUFFER
-      if (output_size < 8)
-        return -1;
-#endif
+      ASSERT_OUTPUT_AVAILABLE(sizeof(qois_end_magic));
 
-      memcpy(output, qois_end_magic, 8);
+      memcpy(output, qois_end_magic, sizeof(qois_end_magic));
 
       state->state = QOIS_STATE_DONE;
-      outputted += 8;
+      outputted += (int)sizeof(qois_end_magic);
     }
 
     return outputted;
@@ -412,19 +408,10 @@ extern "C"
     switch (state->op_position)
     {
     case 0:
-      if (byte != qois_magic[0])
-        return -1;
-      break;
     case 1:
-      if (byte != qois_magic[1])
-        return -1;
-      break;
     case 2:
-      if (byte != qois_magic[2])
-        return -1;
-      break;
     case 3:
-      if (byte != qois_magic[3])
+      if (byte != qois_magic[state->op_position])
         return -1;
       break;
     case 4:
@@ -450,11 +437,11 @@ extern "C"
       break;
     case 11:
       state->desc.height |= byte;
+
+      state->pixels_count = state->desc.width * state->desc.height;
       break;
     case 12:
       state->desc.channels = byte;
-
-      state->pixels_count = state->desc.width * state->desc.height;
       if (state->desc.channels != 3 && state->desc.channels != 4)
         return -1;
       break;
@@ -481,17 +468,17 @@ extern "C"
 
   static inline qois_state _qois_parse_op(uint8_t opcode)
   {
-    if (opcode == 0b11111111)
+    if (opcode == 0xff)
       return QOIS_OP_RGBA;
-    if (opcode == 0b11111110)
+    if (opcode == 0xfe)
       return QOIS_OP_RGB;
-    if (opcode <= 0b00111111)
+    if (opcode <= 0x3f)
       return QOIS_OP_INDEX;
-    if (opcode <= 0b01111111)
+    if (opcode <= 0x7f)
       return QOIS_OP_DIFF;
-    if (opcode <= 0b10111111)
+    if (opcode <= 0xbf)
       return QOIS_OP_LUMA;
-    if (opcode <= 0b11111101)
+    if (opcode <= 0xfd)
       return QOIS_OP_RUN;
     return QOIS_OP_NONE;
   }
@@ -500,11 +487,7 @@ extern "C"
   {
     offset *= state->desc.channels;
 
-#ifdef SAFE_BUFFER
-    if (offset + state->desc.channels > output_size)
-      return -1;
-#endif
-
+    ASSERT_OUTPUT_AVAILABLE(offset + state->desc.channels);
     PROGRESS_OUTPUT(offset);
 
     memcpy(output, &state->current_pixel, state->desc.channels);
@@ -517,10 +500,7 @@ extern "C"
 
   static inline int _qois_decode_copy_current_pixel_n(qois_dec_state *state, uint8_t *output, size_t output_size, size_t offset, size_t count)
   {
-#ifdef SAFE_BUFFER
-    if ((offset + count) * state->desc.channels > output_size)
-      return -1;
-#endif
+    ASSERT_OUTPUT_AVAILABLE((offset + count) * state->desc.channels);
 
     uint8_t channels = state->desc.channels;
 
@@ -529,25 +509,24 @@ extern "C"
 
     qois_pixel *current_pixel = &state->current_pixel;
     for (; output < output_end; output += channels)
-    {
       memcpy(output + offset, current_pixel, channels);
-    }
 
     uint8_t hash = _qois_pixel_hash(&state->current_pixel);
     state->cache[hash] = state->current_pixel;
 
-    return 1;
+    return (int)count;
   }
 
   static inline int _qois_decode_op_byte(qois_dec_state *state, uint8_t byte, uint8_t *output, size_t output_size)
   {
-    uint32_t outputted = 0;
+    uint32_t pixels_outputted = 0;
     if (state->state == QOIS_OP_NONE)
     {
       state->last_pixel = state->current_pixel;
       _qois_pixel_init(&state->current_pixel);
+
       state->state = _qois_parse_op(byte);
-      state->op_data = byte & 0b00111111;
+      state->op_data = byte & 0x3f;
       state->op_position = 0;
     }
 
@@ -555,7 +534,9 @@ extern "C"
     {
     case QOIS_OP_RGB:
     {
-      if (state->op_position == 1)
+      if (state->op_position == 0)
+        ;
+      else if (state->op_position == 1)
         state->current_pixel.r = byte;
       else if (state->op_position == 2)
         state->current_pixel.g = byte;
@@ -563,11 +544,11 @@ extern "C"
       {
         state->current_pixel.b = byte;
 
-        state->state = QOIS_OP_NONE;
-
         if (_qois_decode_copy_current_pixel(state, output, output_size, 0) < 0)
           return -1;
-        outputted++;
+        pixels_outputted++;
+
+        state->state = QOIS_OP_NONE;
       }
       else if (state->op_position >= 4)
         return -1;
@@ -576,7 +557,9 @@ extern "C"
 
     case QOIS_OP_RGBA:
     {
-      if (state->op_position == 1)
+      if (state->op_position == 0)
+        ;
+      else if (state->op_position == 1)
         state->current_pixel.r = byte;
       else if (state->op_position == 2)
         state->current_pixel.g = byte;
@@ -586,11 +569,11 @@ extern "C"
       {
         state->current_pixel.a = byte;
 
-        state->state = QOIS_OP_NONE;
-
         if (_qois_decode_copy_current_pixel(state, output, output_size, 0) < 0)
           return -1;
-        outputted++;
+        pixels_outputted++;
+
+        state->state = QOIS_OP_NONE;
       }
       else if (state->op_position >= 5)
         return -1;
@@ -600,39 +583,41 @@ extern "C"
     case QOIS_OP_INDEX:
     {
       state->current_pixel = state->cache[state->op_data];
-      state->state = QOIS_OP_NONE;
-
       if (_qois_decode_copy_current_pixel(state, output, output_size, 0) < 0)
         return -1;
-      outputted++;
+      pixels_outputted++;
+
+      state->state = QOIS_OP_NONE;
     }
     break;
 
     case QOIS_OP_DIFF:
     {
-      uint8_t dr = ((state->op_data >> 4) & 0b00000011) - 2;
-      uint8_t dg = ((state->op_data >> 2) & 0b00000011) - 2;
-      uint8_t db = ((state->op_data >> 0) & 0b00000011) - 2;
+      uint8_t dr = ((state->op_data >> 4) & 0x03) - 2;
+      uint8_t dg = ((state->op_data >> 2) & 0x03) - 2;
+      uint8_t db = ((state->op_data >> 0) & 0x03) - 2;
 
       state->current_pixel.r = state->last_pixel.r + dr;
       state->current_pixel.g = state->last_pixel.g + dg;
       state->current_pixel.b = state->last_pixel.b + db;
 
-      state->state = QOIS_OP_NONE;
-
       if (_qois_decode_copy_current_pixel(state, output, output_size, 0) < 0)
         return -1;
-      outputted++;
+      pixels_outputted++;
+
+      state->state = QOIS_OP_NONE;
     }
     break;
 
     case QOIS_OP_LUMA:
     {
-      if (state->op_position == 1)
+      if (state->op_position == 0)
+        ;
+      else if (state->op_position == 1)
       {
         uint8_t diff_green = state->op_data - 32;
         uint8_t diff_red = (byte >> 4) - 8;
-        uint8_t diff_blue = (byte & 0b00001111) - 8;
+        uint8_t diff_blue = (byte & 0x0f) - 8;
 
         state->current_pixel.r = state->last_pixel.r + (uint8_t)(diff_green + diff_red);
         state->current_pixel.g = state->last_pixel.g + diff_green;
@@ -642,7 +627,7 @@ extern "C"
 
         if (_qois_decode_copy_current_pixel(state, output, output_size, 0) < 0)
           return -1;
-        outputted++;
+        pixels_outputted++;
       }
       else if (state->op_position > 1)
         return -1;
@@ -656,8 +641,8 @@ extern "C"
       uint8_t length = state->op_data + 1;
       if (_qois_decode_copy_current_pixel_n(state, output, output_size, 0, length) < 0)
         return -1;
+      pixels_outputted += length;
 
-      outputted += length;
       state->state = QOIS_OP_NONE;
     }
     break;
@@ -667,16 +652,13 @@ extern "C"
     }
 
     state->op_position++;
-    state->pixels_out += outputted;
-    return (int)outputted * (int)state->desc.channels;
+    state->pixels_out += pixels_outputted;
+    return (int)(pixels_outputted * state->desc.channels);
   }
 
   static inline int qois_decode_byte(qois_dec_state *state, uint8_t byte, uint8_t *output, size_t output_size)
   {
-#ifdef SAFE_BUFFER
-    if (output_size < state->desc.channels * 64)
-      return -1;
-#endif
+    ASSERT_OUTPUT_AVAILABLE(state->desc.channels * 64);
 
     if (state->state >= QOIS_OP_NONE)
     {
