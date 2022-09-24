@@ -29,7 +29,8 @@ extern "C"
 #endif
 
 // Util functions for converting endianness
-#if defined(__BIG_ENDIAN) || defined(__BIG_ENDIAN__) || defined(_BIG_ENDIAN)
+// Check if the system is big endian
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 #define MAKE_BIG_ENDIAN_32(value) (value)
 #define MAKE_LITTLE_ENDIAN_32(value) __builtin_bswap32(value)
 #else
