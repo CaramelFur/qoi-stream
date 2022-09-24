@@ -88,8 +88,8 @@ extern "C"
   typedef struct _qois_dec_state
   {
     qois_desc desc;
-
     qois_state state;
+
     uint8_t op_data;
     uint8_t op_position;
 
@@ -105,8 +105,8 @@ extern "C"
   typedef struct _qois_enc_state
   {
     qois_desc desc;
-
     qois_state state;
+
     uint8_t pixel_position;
     uint8_t run_length;
 
@@ -170,9 +170,11 @@ extern "C"
     memset(state->cache, 0, sizeof(state->cache));
   }
 
-  void qois_dec_state_init(qois_dec_state *state)
+  void qois_dec_state_init(qois_dec_state *state, uint8_t channels)
   {
     _qois_desc_init(&state->desc);
+    if (channels != 0)
+      state->desc.channels = channels;
 
     state->state = QOIS_STATE_HEADER;
     state->op_data = 0;
@@ -191,7 +193,7 @@ extern "C"
   {
     ASSERT_OUTPUT_AVAILABLE(sizeof(qois_header));
 
-    qois_header *header = (void *)output;
+    qois_header *header = (qois_header *)output;
 
     memcpy(header->magic, qois_magic, sizeof(qois_magic));
 
@@ -441,7 +443,9 @@ extern "C"
       state->pixels_count = state->desc.width * state->desc.height;
       break;
     case 12:
-      state->desc.channels = byte;
+      if (state->desc.channels == 0)
+        state->desc.channels = byte;
+
       if (state->desc.channels != 3 && state->desc.channels != 4)
         return -1;
       break;

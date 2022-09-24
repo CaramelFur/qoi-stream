@@ -11,7 +11,10 @@ int main(int argc, char **argv)
 {
   if (argc < 3)
   {
-    fprintf(stderr, "Usage: %s <input[.qoi]> <output[.qoi]> [width] [height] [channels] [colorspace]", argv[0]);
+    fprintf(stderr, "Usage:\n");
+    fprintf(stderr, "  %s <input.qoi> <output> [channels = 3,4]", argv[0]);
+    fprintf(stderr, "  %s <input> <output.qoi> <width> <height> <channels = 3,4> <colorspace = 0,1>", argv[0]);
+
     return 1;
   }
 
@@ -41,6 +44,18 @@ int main(int argc, char **argv)
 
   if (input_ends_with_qoi)
   {
+    // Check if channels is specified
+    uint8_t channels = 0;
+    if (argc > 3)
+    {
+      channels = (uint8_t)atoi(argv[3]);
+      if (channels != 3 && channels != 4)
+      {
+        fprintf(stderr, "Channels override must be 3 or 4");
+        return 1;
+      }
+    }
+
     // Read file in blocks of 1MB
     const size_t input_buffer_size = 1024 * 1024;
     uint8_t *input_buffer = malloc(input_buffer_size);
@@ -51,9 +66,8 @@ int main(int argc, char **argv)
     size_t output_buffer_pos = 0;
 
     // Read the file in blocks of 1MB and print each byte to stdout
-
     qois_dec_state state;
-    qois_dec_state_init(&state);
+    qois_dec_state_init(&state, channels);
 
     while (true)
     {
