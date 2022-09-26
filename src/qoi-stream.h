@@ -31,11 +31,11 @@ extern "C"
 // Util functions for converting endianness
 // Check if the system is big endian
 #if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-#define MAKE_BIG_ENDIAN_32(value) (value)
-#define MAKE_LITTLE_ENDIAN_32(value) __builtin_bswap32(value)
+#define NATIVE_TO_BIG_ENDIAN(value) (value)
+#define BIG_ENDIAN_TO_NATIVE(value) (value)
 #else
-#define MAKE_BIG_ENDIAN_32(value) __builtin_bswap32(value)
-#define MAKE_LITTLE_ENDIAN_32(value) (value)
+#define NATIVE_TO_BIG_ENDIAN(value) __builtin_bswap32(value)
+#define BIG_ENDIAN_TO_NATIVE(value) __builtin_bswap32(value)
 #endif
 
   // Constants
@@ -188,6 +188,30 @@ extern "C"
     memset(state->cache, 0, sizeof(state->cache));
   }
 
+  // Util functions
+  bool qois_is_qoi(const uint8_t *data, size_t size)
+  {
+    if (size < sizeof(qois_header))
+      return false;
+
+    qois_header *header = (qois_header *)data;
+    return memcmp(header->magic, qois_magic, sizeof(qois_magic)) == 0;
+  }
+
+  bool qois_get_desc(const uint8_t *data, size_t size, qois_desc *desc)
+  {
+    if (!qois_is_qoi(data, size))
+      return false;
+
+    qois_header *header = (qois_header *)data;
+    desc->width = BIG_ENDIAN_TO_NATIVE(header->width);
+    desc->height = BIG_ENDIAN_TO_NATIVE(header->height);
+    desc->channels = header->channels;
+    desc->colorspace = header->colorspace;
+
+    return true;
+  }
+
   // Encode functions
 
   static inline int _qois_encode_header(qois_enc_state *state, uint8_t *output, size_t output_size)
@@ -198,8 +222,8 @@ extern "C"
 
     memcpy(header->magic, qois_magic, sizeof(qois_magic));
 
-    header->width = MAKE_BIG_ENDIAN_32(state->desc.width);
-    header->height = MAKE_BIG_ENDIAN_32(state->desc.height);
+    header->width = NATIVE_TO_BIG_ENDIAN(state->desc.width);
+    header->height = NATIVE_TO_BIG_ENDIAN(state->desc.height);
     header->channels = state->desc.channels;
     header->colorspace = state->desc.colorspace;
 
